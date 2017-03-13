@@ -2,7 +2,7 @@
   (:gen-class)
   (:require [org.httpkit.server :as server]
             [org.httpkit.client :as client]
-            [clojure.core.async :refer [chan go go-loop >! <! close! alts! pipe timeout]]
+            [clojure.core.async :refer [chan go go-loop >! <! close! alts! pipe timeout] :as async]
             [clojure.data.json :as json]
             [clojure.tools.logging :as log]
             [compojure.core :refer :all]
@@ -11,63 +11,85 @@
             [ring.logger :refer [wrap-with-logger]]))
 
 
-(def request-queue (atom {:concurrency         10
-                          :tasks-list          []
+(def concurrency 10)
+
+
+(def request-queue (atom {:tasks-list          []
                           :running-tasks-count 0}))
+
+
+(defn add-task
+  "Adds task to task-list"
+  [queue task]
+  (update queue :tasks-list conj task))
+
+
+(defn inc-running-tasks
+  "Increments running tasks count"
+  [queue]
+  (update queue :running-tasks-count inc))
+
+
+(defn dec-running-tasks
+  "Decrements running tasks count"
+  [queue]
+  (update queue :running-tasks-count dec))
+
+
+(defn pop-task
+  "Removes first task from queue"
+  [queue]
+  (update queue :tasks-list (comp vec rest)))
+
+
+(def proccess-queue-step (comp inc-running-tasks pop-task))
+
+
+(defn handle-task
+  "Final task proccess step"
+  [task-channel]
+  (fn [request-result]
+    (go
+      (>! task-channel request-result)
+      (close! task-channel)
+      (swap! request-queue dec-running-tasks))))
 
 
 (defn add-to-queue
   "Add task to queue"
   [task]
   (let [task-channel (chan)
-        task-with-channel (conj task task-channel)]
-    (swap! request-queue update :tasks-list conj task-with-channel)
+        handler (handle-task task-channel)
+        task-with-handler (conj task handler)]
+    (swap! request-queue add-task task-with-handler)
     task-channel))
 
 
-(defn inc-running-tasks
-  "Increments running tasks count"
-  []
-  (swap! request-queue update :running-tasks-count inc))
-
-
-(defn dec-running-tasks
-  "Decrements running tasks count"
-  []
-  (swap! request-queue update :running-tasks-count dec))
-
-(defn pop-task
-  "Removes first task from queue"
-  []
-  (swap! request-queue update :tasks-list (comp vec rest)))
-
-
+;task scheduler
 (go-loop []
-  (if (< (:running-tasks-count @request-queue) (:concurrency @request-queue))
-    (if-let [[f & args] (-> @request-queue :tasks-list first)]
+  (if-let [task (-> @request-queue :tasks-list first)]
+    (if (< (:running-tasks-count @request-queue) concurrency)
       (do
-        (apply f args)
-        (pop-task)
-        (inc-running-tasks)
+        (swap! request-queue proccess-queue-step)
+        (apply (first task) (rest task))
         (recur))
-      (do
-        (<! (timeout 100))
-        (recur)))
+      (recur))
     (do
+      (<! (timeout 100))
       (recur))))
 
 
 (defn request
   "Make api request"
-  [url params channel]
-  (log/info (str "--SEND request to " url "/" (get-in params [:query-params :text])))
+  [url params done]
+  (log/info (str "--SEND request for " (get-in params [:query-params :text])))
   (client/get url
               params
               (fn [{:keys [status headers body error]}]
+                (log/info (str "--RESIVE response for " (get-in params [:query-params :text])))
                 (if error (log/error error))
                 (let [request-result (if error "" body)]
-                  (go (>! channel request-result)
-                      (close! channel))))))
+                  (done request-result)))))
 
 
 (defn add-request-to-queue
@@ -84,17 +106,12 @@
 (defn collect-task-results
   "Return channel with vector of all tasks results"
   [tasks]
-  (let [tasks-results-channel (chan)
-        tasks-results (atom [])]
-    (go-loop [[result _] (alts! tasks)]
-      (if result
-        (do
-          (dec-running-tasks)
-          (swap! tasks-results conj result)
-          (recur (alts! tasks)))
-        (do
-          (>! tasks-results-channel @tasks-results)
-          (close! tasks-results-channel))))
+  (let [tasks-results-channel (chan)]
+    (go
+      (let [results (<! (async/map (partial conj []) tasks))]
+        (log/info "--STOP collecting")
+        (>! tasks-results-channel results)
+        (close! tasks-results-channel)))
     tasks-results-channel))
 
 
@@ -140,7 +157,7 @@
           done #(server/send! channel (json-response %))]
       (go
         (let [search-result-channel (search query-strings calc-statistic)
-              [result _] (alts! [search-result-channel (timeout 5000)])]
+              [result _] (alts! [search-result-channel])]
           (done (json/write-str result)))))))
 
 
