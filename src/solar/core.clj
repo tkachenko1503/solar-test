@@ -5,13 +5,12 @@
             [clojure.core.async :refer [chan go go-loop >! <! close! alts! pipe timeout] :as async]
             [clojure.data.json :as json]
             [clojure.tools.logging :as log]
+            [clojure.java.io :refer [as-url]]
             [compojure.core :refer :all]
             [compojure.route :as route]
             [ring.middleware.defaults :refer [wrap-defaults site-defaults]]
-            [ring.logger :refer [wrap-with-logger]]))
-
-
-(def concurrency 10)
+            [ring.logger :refer [wrap-with-logger]]
+            [ariane.core :as ariane]))
 
 
 (def request-queue (atom {:tasks-list          []
@@ -65,18 +64,20 @@
     task-channel))
 
 
-;task scheduler
-(go-loop []
-  (if-let [task (-> @request-queue :tasks-list first)]
-    (if (< (:running-tasks-count @request-queue) concurrency)
-      (do
-        (swap! request-queue proccess-queue-step)
-        (apply (first task) (rest task))
+(defn run-scheduler
+  "Start watching and run tasks"
+  [{:keys [concurrency]}]
+  (go-loop []
+    (if-let [task (-> @request-queue :tasks-list first)]
+      (if (< (:running-tasks-count @request-queue) concurrency)
+        (do
+          (swap! request-queue proccess-queue-step)
+          (apply (first task) (rest task))
+          (recur))
         (recur))
-      (recur))
-    (do
-      (<! (timeout 100))
-      (recur))))
+      (do
+        (<! (timeout 100))
+        (recur)))))
 
 
 (defn request
@@ -144,9 +145,14 @@
 (defn calc-statistic
   "Calculates domains statistics"
   [search-results]
-  {"lenta.ru" 5
-   "livejournal.com" 10
-   "vk.com" 20})
+  (let [feeds (->> search-results
+                   (map #(java.io.ByteArrayInputStream. (.getBytes %)))
+                   (map ariane/parse)
+                   (map :entries)
+                   flatten
+                   (map (comp :href first :links))
+                   (map #(.getHost (as-url %))))]
+    feeds))
 
 
 (defn get-domains-statistics [req]
@@ -158,7 +164,10 @@
       (go
         (let [search-result-channel (search query-strings calc-statistic)
               [result _] (alts! [search-result-channel])]
-          (done (json/write-str result)))))))
+          (-> result
+               calc-statistic
+               json/write-str
+               done))))))
 
 
 (defroutes app-routes
@@ -177,5 +186,6 @@
 (defn -main
   "Entry point"
   [& args]
+  (run-scheduler {:concurrency 10})
   (run-server)
   (log/info "server running on port 8080"))
