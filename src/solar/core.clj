@@ -3,14 +3,15 @@
   (:require [org.httpkit.server :as server]
             [org.httpkit.client :as client]
             [clojure.core.async :refer [chan go go-loop >! <! close! alts! pipe timeout] :as async]
-            [clojure.data.json :as json]
             [clojure.tools.logging :as log]
             [clojure.java.io :refer [as-url]]
             [compojure.core :refer :all]
             [compojure.route :as route]
             [ring.middleware.defaults :refer [wrap-defaults site-defaults]]
             [ring.logger :refer [wrap-with-logger]]
-            [ariane.core :as ariane]))
+            [ariane.core :as ariane]
+            [cheshire.core :as json])
+  (:import (java.io ByteArrayInputStream)))
 
 
 (def request-queue (atom {:tasks-list          []
@@ -134,25 +135,60 @@
     :else []))
 
 
-(defn json-response
+(defn pretify-response
   "Format json response"
-  [body]
-  {:status  200
-   :headers {"Content-Type" "application/json"}
-   :body    body})
+  [data]
+  (let [content (json/generate-string data {:pretty true})]
+    {:status 200
+     :body (str "<pre><code>"
+                content
+                "</code></pre>")}))
+
+
+(defn rss-to-stream
+  "Convert rss string to stream"
+  [rss-string]
+  (ByteArrayInputStream. (.getBytes rss-string)))
+
+
+(def get-rss-entries
+  (comp :entries ariane/parse rss-to-stream))
+
+
+(def extract-link
+  (comp :href first :links))
+
+
+(defn extract-uniq-links
+  "Extracts all uniq links"
+  [feeds]
+  (->> feeds
+       flatten
+       (map extract-link)
+       set))
+
+
+(defn get-host-from-url
+  "Extracts host from url"
+  [url]
+  (.getHost (as-url url)))
+
+
+(defn count-host-appearance
+  "Count host frequency"
+  [feeds-links]
+  (->> feeds-links
+       (map get-host-from-url)
+       frequencies))
 
 
 (defn calc-statistic
   "Calculates domains statistics"
   [search-results]
-  (let [feeds (->> search-results
-                   (map #(java.io.ByteArrayInputStream. (.getBytes %)))
-                   (map ariane/parse)
-                   (map :entries)
-                   flatten
-                   (map (comp :href first :links))
-                   (map #(.getHost (as-url %))))]
-    feeds))
+  (let [feeds (map get-rss-entries search-results)
+        all-feeds-uniq-links (extract-uniq-links feeds)
+        host-appearance (count-host-appearance all-feeds-uniq-links)]
+    host-appearance))
 
 
 (defn get-domains-statistics [req]
@@ -160,14 +196,13 @@
   (server/with-channel req channel
     (let [query (get-in req [:query-params "query"])
           query-strings (ensure-queries query)
-          done #(server/send! channel (json-response %))]
+          done #(server/send! channel (pretify-response %))]
       (go
         (let [search-result-channel (search query-strings calc-statistic)
               [result _] (alts! [search-result-channel])]
           (-> result
-               calc-statistic
-               json/write-str
-               done))))))
+              calc-statistic
+              done))))))
 
 
 (defroutes app-routes
