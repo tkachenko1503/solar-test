@@ -12,6 +12,6 @@
                  [compojure "1.5.2"]
                  [ariane "0.1.0-SNAPSHOT"]
                  [cheshire "5.7.0"]]
-  :main ^:skip-aot solar.core
-  :target-path "target/%s"
-  :profiles {:uberjar {:aot :all}})
+  :main solar.core
+  :aot [solar.core]
+  :target-path "target/%s")
